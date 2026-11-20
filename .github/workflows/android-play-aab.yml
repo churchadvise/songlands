@@ -1,0 +1,189 @@
+name: Android Play AAB
+
+# Builds the Godot Android App Bundle (AAB) for Google Play on a Linux
+# runner and keeps it as a workflow artifact.
+# MANUAL TRIGGER ONLY (workflow_dispatch). Do NOT add a push trigger.
+#
+# This repo is PUBLIC and holds no game source (see README.md). The
+# Godot project arrives as a tarball downloaded from Google Drive
+# (repo variable PROJECT_TARBALL_URL), mirroring the ark-pals repo:
+#   curl -L -o project.tar.gz "${{ vars.PROJECT_TARBALL_URL }}"
+#   mkdir project && tar -xzf project.tar.gz -C project --strip-components=1
+# All build steps then run inside project/.
+#
+# Why CI builds the AAB: a local Gradle export is impossible in the dev
+# sandbox — the permission layer holds Java loopback connections, which
+# kills the Gradle daemon handshake (proven 2026-11-19, 3 failed runs).
+#
+# Signing: the Play upload keystore + password arrive as repo secrets
+# (SONGLANDS_UPLOAD_KEYSTORE_B64 / SONGLANDS_KEYSTORE_PASSWORD), are
+# decoded into $RUNNER_TEMP only, and are patched into the RUNNER's copy
+# of export_presets.cfg. The tarball's preset stays clean (empty
+# password, dev-machine keystore path).
+
+on:
+  workflow_dispatch:
+
+env:
+  GODOT_VERSION: "4.7.2-stable"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    defaults:
+      run:
+        working-directory: project
+    steps:
+      - name: Download the Songlands project tarball
+        working-directory: ${{ github.workspace }}
+        run: |
+          curl -fL -o project.tar.gz "${{ vars.PROJECT_TARBALL_URL }}"
+          mkdir project && tar -xzf project.tar.gz -C project --strip-components=1
+          ls project | head
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Install Godot + export templates
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP"
+          curl -fL -o godot.zip "https://github.com/godotengine/godot/releases/download/${GODOT_VERSION}/Godot_v${GODOT_VERSION}_linux.x86_64.zip"
+          unzip -q godot.zip
+          chmod +x "Godot_v${GODOT_VERSION}_linux.x86_64"
+          curl -fL -o templates.tpz "https://github.com/godotengine/godot/releases/download/${GODOT_VERSION}/Godot_v${GODOT_VERSION}_export_templates.tpz"
+          unzip -q templates.tpz
+          TPL_DIR="$HOME/.local/share/godot/export_templates/4.7.2.stable"
+          mkdir -p "$TPL_DIR"
+          cp -R templates/* "$TPL_DIR/"
+          echo "GODOT=$RUNNER_TEMP/Godot_v${GODOT_VERSION}_linux.x86_64" >> "$GITHUB_ENV"
+          "$RUNNER_TEMP/Godot_v${GODOT_VERSION}_linux.x86_64" --version
+
+      - name: Install Android SDK components (Godot 4.7 template needs platform 36 / build-tools 36.1.0 / NDK 29)
+        run: |
+          set -euo pipefail
+          SDK="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
+          echo "Android SDK: $SDK"
+          yes | "$SDK/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+          "$SDK/cmdline-tools/latest/bin/sdkmanager" \
+            "platforms;android-36" "build-tools;36.1.0" \
+            "ndk;29.0.14206865" "platform-tools"
+
+      - name: Godot editor settings + debug keystore
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/.local/share/godot/keystores"
+          keytool -genkeypair -v \
+            -keystore "$HOME/.local/share/godot/keystores/debug.keystore" \
+            -storepass android -alias androiddebugkey -keypass android \
+            -keyalg RSA -keysize 2048 -validity 10000 \
+            -dname "CN=Android Debug,O=Android,C=US"
+          # Let Godot generate its default editor settings, then patch in
+          # the Android export paths.
+          "$GODOT" --headless --editor --quit --path . || true
+          python3 - <<'PYEOF'
+          import os
+          p = os.path.expanduser("~/.config/godot/editor_settings-4.7.tres")
+          settings = {
+              "export/android/android_sdk_path": os.environ.get("ANDROID_HOME", "/usr/local/lib/android/sdk"),
+              "export/android/java_sdk_path": os.environ.get("JAVA_HOME", ""),
+              "export/android/debug_keystore": os.path.expanduser("~/.local/share/godot/keystores/debug.keystore"),
+              "export/android/debug_keystore_pass": "android",
+          }
+          lines = []
+          if os.path.exists(p):
+              lines = open(p).read().splitlines()
+          else:
+              lines = ['[gd_resource type="EditorSettings" format=3]', '', '[resource]']
+          seen = set()
+          out = []
+          for line in lines:
+              stripped = line.strip()
+              replaced = False
+              for k, v in settings.items():
+                  if stripped.startswith(k + " "):
+                      out.append(f'{k} = "{v}"')
+                      seen.add(k)
+                      replaced = True
+                      break
+              if not replaced:
+                  out.append(line)
+          missing = [k for k in settings if k not in seen]
+          if missing:
+              # Insert right after the [resource] header.
+              idx = out.index("[resource]") + 1 if "[resource]" in out else len(out)
+              for k in reversed(missing):
+                  out.insert(idx, f'{k} = "{settings[k]}"')
+          os.makedirs(os.path.dirname(p), exist_ok=True)
+          open(p, "w").write("\n".join(out) + "\n")
+          print("editor settings written:", p)
+          PYEOF
+          grep "export/android" "$HOME/.config/godot/editor_settings-4.7.tres"
+
+      - name: Decode upload keystore (runner only)
+        env:
+          KS_B64: ${{ secrets.SONGLANDS_UPLOAD_KEYSTORE_B64 }}
+          STORE_PW: ${{ secrets.SONGLANDS_KEYSTORE_PASSWORD }}
+        run: |
+          set -euo pipefail
+          KS="$RUNNER_TEMP/songlands-upload.jks"
+          echo "$KS_B64" | base64 --decode > "$KS"
+          chmod 600 "$KS"
+          # NOTE: despite the .jks name, this keystore is PKCS12 (JDK 17
+          # keytool's default when it was created), so it has a SINGLE
+          # password — the store password serves as the key password too,
+          # which is exactly what Godot's Gradle signing config expects.
+          # (KEYSTORE.md's separate "key password" line is inoperative
+          # for PKCS12; the SONGLANDS_KEY_PASSWORD secret is unused.)
+          echo "KS_PATH=$KS" >> "$GITHUB_ENV"
+          keytool -list -v -keystore "$KS" -storepass "$STORE_PW" | grep -E "Alias|SHA256"
+
+      - name: Patch export preset (runner only — never committed)
+        env:
+          STORE_PW: ${{ secrets.SONGLANDS_KEYSTORE_PASSWORD }}
+        run: |
+          set -euo pipefail
+          python3 - "$KS_PATH" "$STORE_PW" <<'PYEOF'
+          import re, sys
+          ks, pw = sys.argv[1], sys.argv[2]
+          p = "export_presets.cfg"
+          s = open(p).read()
+          head, sep, tail = s.partition("[preset.2.options]")
+          assert sep, "preset.2 (Android Play (AAB)) not found"
+          tail, n1 = re.subn(r'keystore/release="[^"]*"',
+                             'keystore/release="' + ks + '"', tail, count=1)
+          tail, n2 = re.subn(r'keystore/release_password="[^"]*"',
+                             'keystore/release_password="' + pw + '"', tail, count=1)
+          assert n1 == 1 and n2 == 1, f"preset patch failed: {n1}/{n2}"
+          open(p, "w").write(head + sep + tail)
+          print("preset.2 patched: keystore path + release password set")
+          PYEOF
+
+      - name: Export AAB (installs the Android build template, then exports)
+        run: |
+          set -euo pipefail
+          mkdir -p "$GITHUB_WORKSPACE/build_out"
+          "$GODOT" --headless --path . --import
+          "$GODOT" --headless --path . --install-android-build-template \
+            --export-release "Android Play (AAB)" \
+            "$GITHUB_WORKSPACE/build_out/Songlands.aab"
+          ls -la "$GITHUB_WORKSPACE/build_out"
+          # The pristine 4.7.2 template wrapper already points at the
+          # standard Gradle distribution URL; assert no sandbox-only
+          # file:// URL slipped into the generated project.
+          if grep -r "distributionUrl=file:" android/ 2>/dev/null; then
+            echo "ERROR: sandbox file:// Gradle distribution URL present" >&2
+            exit 1
+          fi
+          keytool -printcert -jarfile "$GITHUB_WORKSPACE/build_out/Songlands.aab" | grep -E "SHA256|Owner" || true
+
+      - name: Upload AAB artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: songlands-aab
+          path: build_out/Songlands.aab
+          if-no-files-found: error

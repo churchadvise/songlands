@@ -1,0 +1,132 @@
+name: iOS TestFlight
+
+# Builds the Godot iOS export on a cloud Mac, archives it with automatic
+# signing (App Store Connect API key), and uploads the build to TestFlight.
+# MANUAL TRIGGER ONLY (workflow_dispatch): every run consumes paid macOS
+# minutes, and studio rule (Eric, 2026-11-17) is that a build runs only
+# with his specific approval for that build. Do NOT add a push trigger.
+#
+# This repo is PUBLIC and holds no game source (see README.md). The
+# Godot project arrives as a tarball downloaded from Google Drive
+# (repo variable PROJECT_TARBALL_URL), mirroring the ark-pals repo:
+#   curl -L -o project.tar.gz "${{ vars.PROJECT_TARBALL_URL }}"
+#   mkdir project && tar -xzf project.tar.gz -C project --strip-components=1
+# All build steps then run inside project/.
+
+on:
+  workflow_dispatch:
+
+env:
+  GODOT_VERSION: "4.7.2-stable"
+  TEAM_ID: "YZY5R75XTP"
+  ASC_KEY_ID: "MYMD552YY5"
+  ASC_ISSUER_ID: "e56ffda2-e73e-4fa9-b1e3-ba89afb9f9c9"
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 60
+    defaults:
+      run:
+        working-directory: project
+    steps:
+      - name: Download the Songlands project tarball
+        working-directory: ${{ github.workspace }}
+        run: |
+          curl -fL -o project.tar.gz "${{ vars.PROJECT_TARBALL_URL }}"
+          mkdir project && tar -xzf project.tar.gz -C project --strip-components=1
+          ls project | head
+
+      - name: Install Godot + export templates
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP"
+          curl -fL -o godot.zip "https://github.com/godotengine/godot/releases/download/${GODOT_VERSION}/Godot_v${GODOT_VERSION}_macos.universal.zip"
+          unzip -q godot.zip
+          curl -fL -o templates.tpz "https://github.com/godotengine/godot/releases/download/${GODOT_VERSION}/Godot_v${GODOT_VERSION}_export_templates.tpz"
+          unzip -q templates.tpz
+          TPL_DIR="$HOME/Library/Application Support/Godot/export_templates/4.7.2.stable"
+          mkdir -p "$TPL_DIR"
+          cp -R templates/* "$TPL_DIR/"
+          echo "GODOT=$RUNNER_TEMP/Godot.app/Contents/MacOS/Godot" >> "$GITHUB_ENV"
+          "$RUNNER_TEMP/Godot.app/Contents/MacOS/Godot" --version
+
+      - name: Write the App Store Connect API key
+        env:
+          ASC_API_KEY_P8_B64: ${{ secrets.ASC_API_KEY_P8_B64 }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/.appstoreconnect/private_keys" "$RUNNER_TEMP/asc"
+          echo "$ASC_API_KEY_P8_B64" | base64 --decode > "$RUNNER_TEMP/asc/AuthKey_${ASC_KEY_ID}.p8"
+          cp "$RUNNER_TEMP/asc/AuthKey_${ASC_KEY_ID}.p8" "$HOME/.appstoreconnect/private_keys/"
+          chmod 600 "$RUNNER_TEMP/asc/AuthKey_${ASC_KEY_ID}.p8" "$HOME/.appstoreconnect/private_keys/AuthKey_${ASC_KEY_ID}.p8"
+
+      - name: Godot iOS export
+        run: |
+          set -euo pipefail
+          mkdir -p ios_out
+          "$GODOT" --headless --path . --import
+          "$GODOT" --headless --path . --export-release "iOS" ios_out/Songlands.xcodeproj
+          ls -la ios_out
+
+      - name: Archive (automatic signing via API key)
+        run: |
+          set -euo pipefail
+          xcodebuild \
+            -project ios_out/Songlands.xcodeproj \
+            -scheme Songlands \
+            -configuration Release \
+            -destination "generic/platform=iOS" \
+            -archivePath "$RUNNER_TEMP/Songlands.xcarchive" \
+            -allowProvisioningUpdates \
+            -authenticationKeyPath "$RUNNER_TEMP/asc/AuthKey_${ASC_KEY_ID}.p8" \
+            -authenticationKeyID "$ASC_KEY_ID" \
+            -authenticationKeyIssuerID "$ASC_ISSUER_ID" \
+            archive
+
+      - name: Export the IPA
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/ExportOptions.plist" <<PLIST
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>method</key>
+            <string>app-store-connect</string>
+            <key>teamID</key>
+            <string>${TEAM_ID}</string>
+            <key>signingStyle</key>
+            <string>automatic</string>
+            <key>stripSwiftSymbols</key>
+            <true/>
+            <key>manageAppVersionAndBuildNumber</key>
+            <false/>
+            <key>uploadSymbols</key>
+            <false/>
+          </dict>
+          </plist>
+          PLIST
+          xcodebuild -exportArchive \
+            -archivePath "$RUNNER_TEMP/Songlands.xcarchive" \
+            -exportPath "$RUNNER_TEMP/ipa" \
+            -exportOptionsPlist "$RUNNER_TEMP/ExportOptions.plist" \
+            -allowProvisioningUpdates \
+            -authenticationKeyPath "$RUNNER_TEMP/asc/AuthKey_${ASC_KEY_ID}.p8" \
+            -authenticationKeyID "$ASC_KEY_ID" \
+            -authenticationKeyIssuerID "$ASC_ISSUER_ID"
+          ls -la "$RUNNER_TEMP/ipa"
+
+      - name: Upload to App Store Connect (TestFlight)
+        run: |
+          set -euo pipefail
+          IPA=$(ls "$RUNNER_TEMP"/ipa/*.ipa | head -1)
+          xcrun altool --upload-app -f "$IPA" --apiKey "$ASC_KEY_ID" --apiIssuer "$ASC_ISSUER_ID"
+
+      - name: Keep the IPA as a workflow artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: songlands-ipa
+          path: ${{ runner.temp }}/ipa/*.ipa
+          if-no-files-found: ignore
