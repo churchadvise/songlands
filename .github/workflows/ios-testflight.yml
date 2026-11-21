@@ -66,7 +66,13 @@ jobs:
           set -euo pipefail
           mkdir -p ios_out
           "$GODOT" --headless --path . --import
-          "$GODOT" --headless --path . --export-release "iOS" ios_out/Songlands.xcodeproj
+          # Godot's export ends with its own xcodebuild archive, which
+          # cannot sign on a CI runner (no Xcode account for automatic
+          # provisioning) and fails AFTER the Xcode project has been
+          # fully generated. Tolerate that failure; the Archive step
+          # below does the real signed build with the API key.
+          "$GODOT" --headless --path . --export-release "iOS" ios_out/Songlands.xcodeproj || echo "Godot's built-in archive failed as expected on CI; continuing with the generated project."
+          test -d ios_out/Songlands.xcodeproj
           ls -la ios_out
 
       - name: Archive (automatic signing via API key)
