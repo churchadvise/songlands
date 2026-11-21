@@ -26,7 +26,13 @@ env:
 
 jobs:
   build:
-    runs-on: macos-15
+    # macos-26 (NOT macos-15): Godot 4.7.2's iOS templates are built
+    # against the iOS 26 SDK (Metal tensor / QuartzCore dynamic-range
+    # symbols); the macos-15 image's Xcode 16.4 / iPhoneOS 18.5 SDK
+    # cannot link them (run 4, 2026-11-21 — same failure The Lost
+    # Coin's run 41 proved). The macos-26 image's default Xcode is
+    # 26.x with the iOS 26 SDK; no xcode-select step is needed.
+    runs-on: macos-26
     timeout-minutes: 60
     defaults:
       run:
